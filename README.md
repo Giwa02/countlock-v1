@@ -90,6 +90,7 @@ Open http://localhost:8888 (Netlify Dev proxies Vite + functions).
 | `ROBOFLOW_MODEL_URL` | e.g. `https://detect.roboflow.com/YOUR_PROJECT/YOUR_VERSION` |
 | `ROBOFLOW_API_KEY` | Roboflow API key |
 | `COUNT_CONFIDENCE_THRESHOLD` | Default `0.65` — predictions below this are dropped |
+| `COUNT_EDGE_MARGIN_RATIO` | Default `0.015` — predictions whose bounding box touches within this fraction of the image edge are treated as cut off and dropped from the count |
 | `RESEND_API_KEY` | Resend API key |
 | `SUPERVISOR_EMAIL` | Recipient for review emails |
 | `FROM_EMAIL` | e.g. `CountLock <countlock@yourdomain.com>` |
@@ -105,9 +106,16 @@ MOCK_COUNT=false
 ROBOFLOW_MODEL_URL=https://detect.roboflow.com/YOUR_PROJECT/YOUR_VERSION
 ROBOFLOW_API_KEY=...
 COUNT_CONFIDENCE_THRESHOLD=0.65
+COUNT_EDGE_MARGIN_RATIO=0.015
 ```
 
-The Roboflow model must be an object-detection model that draws one bounding box per visible part. The function counts predictions above the confidence threshold.
+The Roboflow model must be an object-detection model that draws one bounding box per visible part. The function counts predictions above the confidence threshold and discards any whose box touches the image edge (treated as cut off). The number of dropped boxes is returned to the UI as `edgeClipped` so the operator can be told to recompose.
+
+### Framing guide
+
+The operator screen overlays a gold rectangle on the camera view. Capture crops the frame to this rectangle before upload, so the detection model only ever sees a fixed central region of the operator's shot — keeping the input distribution tight across freehand phone angles.
+
+Training photos uploaded to Roboflow MUST be cropped to the same proportions (`FRAMING_GUIDE` in `src/main.jsx`: x=6%, y=10%, w=88%, h=80%). If the inference crop and training crop drift apart, accuracy drops.
 
 ## Re-open semantics
 

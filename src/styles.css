@@ -464,6 +464,69 @@ video {
   gap: 8px;
 }
 
+/* ── Framing guide overlay ──────────────────────────────────────────────
+   Visible only while the camera is live and the kit is open. Outside the
+   gold rectangle is dimmed via a huge box-shadow (relies on overflow:hidden
+   on .camera-wrap, which is already set). Corner brackets reinforce the
+   active zone and read better than a bare outline on noisy backgrounds. */
+
+.framing-guide {
+  position: absolute;
+  pointer-events: none;
+  outline: 2px solid var(--gold);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.38);
+}
+
+.framing-guide-corner {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  border: 3px solid var(--bone);
+}
+
+.framing-guide-corner.tl {
+  top: -3px;
+  left: -3px;
+  border-right: none;
+  border-bottom: none;
+}
+
+.framing-guide-corner.tr {
+  top: -3px;
+  right: -3px;
+  border-left: none;
+  border-bottom: none;
+}
+
+.framing-guide-corner.bl {
+  bottom: -3px;
+  left: -3px;
+  border-right: none;
+  border-top: none;
+}
+
+.framing-guide-corner.br {
+  bottom: -3px;
+  right: -3px;
+  border-left: none;
+  border-top: none;
+}
+
+.framing-guide-label {
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--bone);
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
 .status {
   margin: 14px 0;
   min-height: 24px;

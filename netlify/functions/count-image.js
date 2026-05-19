@@ -96,6 +96,7 @@ export async function handler(event) {
     count: result.count,
     confidence: result.confidence,
     mode: result.mode,
+    edgeClipped: result.edgeClipped || 0,
     expected: Number(part.expected),
     pass: Number(result.count) === Number(part.expected),
   });
@@ -111,7 +112,13 @@ async function runDetection(imageBase64) {
     // Mock returns counts in [1, 10] inclusive. The sample CSV has expecteds
     // up to 33 — adjust the CSV or set MOCK_COUNT=false for real coverage.
     const mockCount = 1 + Math.floor(Math.random() * 10);
-    return { count: mockCount, confidence: 0.99, mode: "mock", predictions: [] };
+    return {
+      count: mockCount,
+      confidence: 0.99,
+      mode: "mock",
+      predictions: [],
+      edgeClipped: 0,
+    };
   }
 
   const base64 = String(imageBase64).replace(/^data:image\/\w+;base64,/, "");
@@ -142,8 +149,53 @@ async function runDetection(imageBase64) {
   }
 
   const threshold = Number(process.env.COUNT_CONFIDENCE_THRESHOLD || 0.65);
+  // Boxes within this fraction of the image edge are treated as cut off and
+  // dropped from the count. Cropping client-side already eliminates most
+  // edge-clipped parts, but if the operator hasn't recomposed and a part is
+  // still partly inside the gold frame, this catches it server-side too.
+  const edgeMarginRatio = Number(process.env.COUNT_EDGE_MARGIN_RATIO || 0.015);
+
   const predictions = Array.isArray(result.predictions) ? result.predictions : [];
-  const accepted = predictions.filter((p) => Number(p.confidence || 0) >= threshold);
+
+  // Roboflow returns the inference image dimensions on result.image. Without
+  // them we can't tell where the edges are, so we skip edge filtering for
+  // this prediction set — better to over-count than crash the request.
+  const imageWidth = Number(result?.image?.width || 0);
+  const imageHeight = Number(result?.image?.height || 0);
+  const canFilterEdges = imageWidth > 0 && imageHeight > 0;
+  const marginX = canFilterEdges ? imageWidth * edgeMarginRatio : 0;
+  const marginY = canFilterEdges ? imageHeight * edgeMarginRatio : 0;
+
+  const accepted = [];
+  let edgeClipped = 0;
+
+  for (const p of predictions) {
+    if (Number(p.confidence || 0) < threshold) continue;
+
+    if (canFilterEdges) {
+      // Roboflow box format: (x, y) is the CENTER of the box.
+      const cx = Number(p.x ?? 0);
+      const cy = Number(p.y ?? 0);
+      const bw = Number(p.width ?? 0);
+      const bh = Number(p.height ?? 0);
+      const left = cx - bw / 2;
+      const top = cy - bh / 2;
+      const right = cx + bw / 2;
+      const bottom = cy + bh / 2;
+
+      const touchesEdge =
+        left <= marginX ||
+        top <= marginY ||
+        right >= imageWidth - marginX ||
+        bottom >= imageHeight - marginY;
+
+      if (touchesEdge) {
+        edgeClipped += 1;
+        continue;
+      }
+    }
+    accepted.push(p);
+  }
 
   const avgConfidence =
     accepted.length === 0
@@ -156,5 +208,6 @@ async function runDetection(imageBase64) {
     confidence: Number(avgConfidence.toFixed(4)),
     mode: "roboflow",
     predictions: accepted,
+    edgeClipped,
   };
 }

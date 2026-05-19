@@ -15,6 +15,46 @@ import {
 import "./styles.css";
 
 // ───────────────────────────────────────────────────────────────────────────
+// Framing guide
+//
+// Defines the central region of the camera frame that operators must fit all
+// parts inside. We crop the captured frame to this region before upload, so
+// the detection model only ever sees a known active zone. This keeps the
+// training distribution tight even when operators hold the phone at varying
+// angles and distances — anything outside the gold frame is discarded both
+// visually (operator sees it dimmed) and in code (cropped away before
+// Roboflow ever sees it).
+//
+// Training photos MUST also be cropped to these same bounds so train and
+// inference distributions match.
+// ───────────────────────────────────────────────────────────────────────────
+
+const FRAMING_GUIDE = Object.freeze({
+  x: 0.06, // left edge, fraction of video width
+  y: 0.10, // top edge, fraction of video height
+  w: 0.88, // width as fraction of video width
+  h: 0.80, // height as fraction of video height
+});
+
+function FramingGuide({ bounds }) {
+  const style = {
+    left: `${bounds.x * 100}%`,
+    top: `${bounds.y * 100}%`,
+    width: `${bounds.w * 100}%`,
+    height: `${bounds.h * 100}%`,
+  };
+  return (
+    <div className="framing-guide" style={style} aria-hidden="true">
+      <span className="framing-guide-corner tl" />
+      <span className="framing-guide-corner tr" />
+      <span className="framing-guide-corner bl" />
+      <span className="framing-guide-corner br" />
+      <span className="framing-guide-label">Fit all parts inside this frame</span>
+    </div>
+  );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // API helpers
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -386,6 +426,7 @@ function OperatorView({ projectId, kitId, onBack, onError }) {
   const [status, setStatus] = useState("Loading kit…");
   const [cameraReady, setCameraReady] = useState(false);
   const [cameraError, setCameraError] = useState("");
+  const [videoAspect, setVideoAspect] = useState(null);
   const [isCounting, setIsCounting] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -413,7 +454,7 @@ function OperatorView({ projectId, kitId, onBack, onError }) {
         } else if (found.status === "locked") {
           setStatus(`Kit locked. Tap Re-open to re-take any part.`);
         } else {
-          setStatus("Place the first part group on the mat.");
+          setStatus("Place all parts for the first group inside the gold frame, then tap Picture.");
         }
       } catch (error) {
         if (cancelled) return;
@@ -449,8 +490,23 @@ function OperatorView({ projectId, kitId, onBack, onError }) {
         }
         stream = acquired;
         if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          setCameraReady(true);
+          const v = videoRef.current;
+          v.srcObject = stream;
+          const onMeta = () => {
+            if (cancelled) return;
+            if (v.videoWidth && v.videoHeight) {
+              setVideoAspect(v.videoWidth / v.videoHeight);
+            }
+            setCameraReady(true);
+          };
+          // If metadata is already loaded (rare but possible if browser
+          // attached the track synchronously), the loadedmetadata event won't
+          // fire again. Detect that case via readyState.
+          if (v.readyState >= 1) {
+            onMeta();
+          } else {
+            v.onloadedmetadata = onMeta;
+          }
         }
       } catch (error) {
         if (!cancelled) setCameraError(`Camera unavailable: ${error.message}`);
@@ -479,12 +535,29 @@ function OperatorView({ projectId, kitId, onBack, onError }) {
     setIsCounting(true);
     const video = videoRef.current;
     const canvas = canvasRef.current;
-    const width = video.videoWidth || 1280;
-    const height = video.videoHeight || 720;
-    canvas.width = width;
-    canvas.height = height;
+    // Use real intrinsic dimensions if available; fall back only if metadata
+    // hasn't loaded yet. Falling back risks an empty draw (videoWidth=0) so
+    // we bail out cleanly instead.
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh) {
+      setStatus("Camera not ready yet. Try again in a second.");
+      setIsCounting(false);
+      return;
+    }
+
+    // Crop to the framing guide region. The detector only sees this central
+    // patch, matching the cropped training distribution. Anything that wasn't
+    // inside the gold frame on screen is dropped here.
+    const sx = Math.round(vw * FRAMING_GUIDE.x);
+    const sy = Math.round(vh * FRAMING_GUIDE.y);
+    const sw = Math.round(vw * FRAMING_GUIDE.w);
+    const sh = Math.round(vh * FRAMING_GUIDE.h);
+
+    canvas.width = sw;
+    canvas.height = sh;
     const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, width, height);
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
     const imageBase64 = canvas.toDataURL("image/jpeg", 0.82);
 
     try {
@@ -494,15 +567,19 @@ function OperatorView({ projectId, kitId, onBack, onError }) {
         imageBase64,
       });
 
-      setStatus(
-        result.pass
-          ? `Detected ${result.count} · Expected ${result.expected} · PASS`
-          : `Detected ${result.count} · Expected ${result.expected} · MISMATCH`
-      );
+      const clipped = Number(result.edgeClipped || 0);
+      const verdict = result.pass ? "PASS" : "MISMATCH";
+      const base = `Detected ${result.count} · Expected ${result.expected} · ${verdict}`;
+      const clipNote =
+        clipped > 0
+          ? ` · ${clipped} part${clipped === 1 ? "" : "s"} cut off at edge — recompose inside the gold frame and retake`
+          : "";
+      setStatus(base + clipNote);
 
       await refreshProject();
 
-      if (partIndex < project.parts.length - 1) {
+      // Auto-advance only on a clean pass with no edge clipping.
+      if (result.pass && clipped === 0 && partIndex < project.parts.length - 1) {
         setPartIndex((value) => value + 1);
       }
     } catch (error) {
@@ -635,9 +712,13 @@ function OperatorView({ projectId, kitId, onBack, onError }) {
         </div>
       </div>
 
-      <div className="camera-wrap">
+      <div
+        className="camera-wrap"
+        style={videoAspect ? { aspectRatio: videoAspect } : undefined}
+      >
         <video ref={videoRef} autoPlay playsInline muted />
         <canvas ref={canvasRef} hidden />
+        {cameraReady && !isLocked && <FramingGuide bounds={FRAMING_GUIDE} />}
         {!cameraReady && (
           <div className="camera-placeholder">
             {cameraError || "Waiting for camera…"}

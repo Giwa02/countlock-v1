@@ -77,3 +77,128 @@ export async function getRoboflowConfig(db, org) {
     activeVersion: active?.version ?? null,
   };
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Roboflow REST endpoints
+//
+// Confidence levels (verified against Roboflow docs, May 2026):
+//   - UPLOAD  : api.roboflow.com/dataset/{project}/upload  — well documented
+//   - ANNOTATE: api.roboflow.com/dataset/{project}/annotate/{imageId} — documented
+//   - PROJECT : api.roboflow.com/{workspace}/{project} — documented (class list)
+//   - VERSION : api.roboflow.com/{workspace}/{project}/{version} — documented
+//   - CREATE VERSION + TRAIN — SDK-wrapped, under-documented and known-finicky.
+//     Those live in trigger-training/training-status and MUST be confirmed on
+//     the first live training run. The four helpers below are the safe set.
+// ───────────────────────────────────────────────────────────────────────────
+
+const RF_API = "https://api.roboflow.com";
+
+/**
+ * Build a Pascal VOC XML annotation. Roboflow auto-detects VOC and reads the
+ * class name inline from each <object><name>, so no separate labelmap file.
+ * Pass an empty boxes array to register a confirmed background/null image
+ * (an annotation file with zero objects) — reduces false positives.
+ *
+ * @param {{filename:string, width:number, height:number,
+ *          boxes:Array<{className:string,xmin:number,ymin:number,xmax:number,ymax:number}>}}
+ */
+export function buildVocXml({ filename, width, height, boxes = [] }) {
+  const esc = (s) =>
+    String(s).replace(/[<>&'"]/g, (c) =>
+      ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" }[c])
+    );
+  const objects = boxes
+    .map(
+      (b) => `  <object>
+    <name>${esc(b.className)}</name>
+    <bndbox>
+      <xmin>${Math.round(b.xmin)}</xmin>
+      <ymin>${Math.round(b.ymin)}</ymin>
+      <xmax>${Math.round(b.xmax)}</xmax>
+      <ymax>${Math.round(b.ymax)}</ymax>
+    </bndbox>
+  </object>`
+    )
+    .join("\n");
+  return `<annotation>
+  <filename>${esc(filename)}</filename>
+  <size>
+    <width>${Math.round(width)}</width>
+    <height>${Math.round(height)}</height>
+    <depth>3</depth>
+  </size>
+${objects}
+</annotation>`;
+}
+
+/**
+ * Upload one training image to the Roboflow dataset, then attach its VOC
+ * annotation (or register it as a background image when boxes is empty).
+ *
+ * @returns {Promise<{ imageId: string }>}
+ */
+export async function uploadTrainingImage({
+  apiKey, project, base64Jpeg, filename, batch, boxes, width, height,
+}) {
+  const clean = String(base64Jpeg).replace(/^data:image\/\w+;base64,/, "");
+
+  // 1. Upload the image bytes.
+  const uploadUrl = new URL(`${RF_API}/dataset/${project}/upload`);
+  uploadUrl.searchParams.set("api_key", apiKey);
+  uploadUrl.searchParams.set("name", filename);
+  uploadUrl.searchParams.set("split", "train");
+  if (batch) uploadUrl.searchParams.set("batch", batch);
+
+  const upRes = await fetch(uploadUrl.toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: clean,
+  });
+  const upJson = await upRes.json().catch(() => ({}));
+  if (!upRes.ok || !(upJson.id || upJson.image?.id)) {
+    throw new Error(`Roboflow image upload failed (${upRes.status}): ${upJson.message || JSON.stringify(upJson)}`);
+  }
+  const imageId = upJson.id || upJson.image.id;
+
+  // 2. Attach VOC annotation (zero objects = confirmed background/null image).
+  const xml = buildVocXml({ filename, width, height, boxes: boxes || [] });
+  const annUrl = new URL(`${RF_API}/dataset/${project}/annotate/${imageId}`);
+  annUrl.searchParams.set("api_key", apiKey);
+  annUrl.searchParams.set("name", `${filename}.xml`);
+
+  const annRes = await fetch(annUrl.toString(), {
+    method: "POST",
+    headers: { "Content-Type": "text/plain" },
+    body: xml,
+  });
+  if (!annRes.ok) {
+    const annJson = await annRes.json().catch(() => ({}));
+    throw new Error(`Roboflow annotate failed (${annRes.status}): ${annJson.message || JSON.stringify(annJson)}`);
+  }
+
+  return { imageId };
+}
+
+/**
+ * List the classes the project currently knows about. Used to flag untrained
+ * parts (a brand-new part class won't appear here). Returns lowercased class
+ * names for case-insensitive comparison.
+ *
+ * @returns {Promise<string[]>}
+ */
+export async function listProjectClasses({ apiKey, workspace, project }) {
+  const url = new URL(`${RF_API}/${workspace}/${project}`);
+  url.searchParams.set("api_key", apiKey);
+
+  const res = await fetch(url.toString());
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Roboflow project fetch failed (${res.status}): ${data.message || JSON.stringify(data)}`);
+  }
+
+  // The project payload exposes classes as an object keyed by class name
+  // (value = instance count). Fall back to a few other shapes defensively.
+  const classObj = data.project?.classes || data.classes || {};
+  const names = Array.isArray(classObj) ? classObj : Object.keys(classObj);
+  return names.map((n) => String(n).toLowerCase());
+}

@@ -202,3 +202,38 @@ export async function listProjectClasses({ apiKey, workspace, project }) {
   const names = Array.isArray(classObj) ? classObj : Object.keys(classObj);
   return names.map((n) => String(n).toLowerCase());
 }
+
+/**
+ * Best-effort training-state read for the project's latest version/model.
+ * Roboflow's project payload lists versions with optional model info. For
+ * free Instant models the exact shape varies, so this is advisory only — the
+ * reliable activation path is the supervisor confirming the model URL from
+ * Roboflow's Deploy page (see activate-model). Needs live confirmation.
+ *
+ * @returns {Promise<{ ready: boolean, latestVersion: number|null, raw: object }>}
+ */
+export async function getLatestTrainingState({ apiKey, workspace, project }) {
+  const url = new URL(`${RF_API}/${workspace}/${project}`);
+  url.searchParams.set("api_key", apiKey);
+  const res = await fetch(url.toString());
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Roboflow project fetch failed (${res.status}): ${data.message || JSON.stringify(data)}`);
+  }
+  const versions = Array.isArray(data.versions) ? data.versions : [];
+  let latestVersion = null;
+  let ready = false;
+  for (const v of versions) {
+    const num = Number(v.id?.split("/").pop() || v.version || 0);
+    if (num > (latestVersion || 0)) {
+      latestVersion = num;
+      ready = Boolean(v.model || v.train?.model || v.exports);
+    }
+  }
+  return { ready, latestVersion, raw: data };
+}
+
+/** Roboflow dashboard deep-link to the Models/Train page (free-tier retrain). */
+export function trainDeepLink(workspace, project) {
+  return `https://app.roboflow.com/${workspace}/${project}/models`;
+}

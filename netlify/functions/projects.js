@@ -71,7 +71,7 @@ async function getProject(id) {
   const [partsRes, kitsRes] = await Promise.all([
     db
       .from("project_parts")
-      .select("part_id, position, expected")
+      .select("id, part_id, part_name, position, expected, training_status")
       .eq("project_id", id)
       .order("position"),
     db
@@ -121,6 +121,13 @@ async function getProject(id) {
 async function createProject(event) {
   const body = readJson(event);
   if (!body) return json({ error: "Invalid JSON body" }, 400);
+
+  // Guided wizard path: structured parts with display names. Bypasses the CSV
+  // parser (which requires numeric part columns) so parts can be named.
+  if (Array.isArray(body.parts) && body.parts.length > 0) {
+    return await createProjectStructured(body);
+  }
+
   const { csvText, filename } = body;
   if (!csvText) return json({ error: "csvText is required" }, 400);
 
@@ -164,6 +171,76 @@ async function createProject(event) {
       return json({ error: "A project with that data already exists" }, 409);
     }
     throw rpcError;
+  }
+
+  return getProject(projectId);
+}
+
+// Slugify a part name into a stable, Roboflow-class-safe identifier.
+function slugifyClass(s) {
+  return String(s)
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+}
+
+async function createProjectStructured(body) {
+  const name = String(body.name || "New Kit").trim() || "New Kit";
+
+  const kitNames =
+    Array.isArray(body.kitNames) && body.kitNames.length
+      ? body.kitNames.map((k) => String(k).trim()).filter(Boolean)
+      : ["Kit 1"];
+
+  // Validate + normalize parts.
+  const seen = new Set();
+  const parts = [];
+  body.parts.forEach((p, i) => {
+    const partName = String(p.partName || p.name || "").trim();
+    const identifier = String(p.partId || p.identifier || "").trim();
+    const partId = slugifyClass(identifier || partName);
+    if (!partId) throw new Error(`Part ${i + 1} needs a name or identifier.`);
+    if (seen.has(partId)) throw new Error(`Duplicate part identifier "${partId}".`);
+    seen.add(partId);
+
+    const expected = Number(p.expected);
+    if (!Number.isInteger(expected) || expected < 0) {
+      throw new Error(`Part "${partName || partId}" needs a whole-number expected count.`);
+    }
+    parts.push({ partId, partName: partName || partId, position: i + 1, expected });
+  });
+
+  if (parts.length === 0) throw new Error("At least one part is required.");
+
+  const db = supabase();
+
+  let projectId;
+  try {
+    const { data, error } = await db.rpc("create_project_atomic", {
+      p_org_id: orgId(),
+      p_name: name,
+      p_csv_filename: null,
+      p_parts: parts.map((p) => ({ partId: p.partId, position: p.position, expected: p.expected })),
+      p_kit_names: kitNames,
+    });
+    if (error) {
+      if (error.code === "23505") return json({ error: "A project with that data already exists" }, 409);
+      throw error;
+    }
+    projectId = data;
+  } catch (err) {
+    return json({ error: err.message || "Could not create project" }, 500);
+  }
+
+  // Stamp display names + mark parts untrained (they need training before use).
+  for (const p of parts) {
+    await db
+      .from("project_parts")
+      .update({ part_name: p.partName, training_status: "untrained" })
+      .eq("project_id", projectId)
+      .eq("part_id", p.partId);
   }
 
   return getProject(projectId);

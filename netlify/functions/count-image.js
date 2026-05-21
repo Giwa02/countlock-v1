@@ -1,4 +1,5 @@
 import { supabase, orgId, json, readJson } from "./_supabase.js";
+import { getActiveModel, getEnv } from "./_roboflow.js";
 
 // Netlify Functions sync request limit is 6 MB. After base64 padding the JPEG
 // has to be smaller than that. We hold a hard cap with margin.
@@ -57,10 +58,14 @@ export async function handler(event) {
     return json({ error: `Part ${partId} is not in this project` }, 400);
   }
 
+  // Resolve the active inference model from the DB (env-var fallback).
+  // This is the activation pointer Training Mode updates on completion.
+  const activeModel = await getActiveModel(db, orgId());
+
   // Run detection (mock or Roboflow)
   let result;
   try {
-    result = await runDetection(imageBase64);
+    result = await runDetection(imageBase64, activeModel);
   } catch (error) {
     console.error("Detection failed:", error);
     return json({ error: `Detection failed: ${error.message}` }, 502);
@@ -102,11 +107,12 @@ export async function handler(event) {
   });
 }
 
-async function runDetection(imageBase64) {
+async function runDetection(imageBase64, activeModel) {
+  const modelUrl = activeModel?.modelUrl || "";
   const useRoboflow =
-    process.env.MOCK_COUNT !== "true" &&
-    process.env.ROBOFLOW_MODEL_URL &&
-    process.env.ROBOFLOW_API_KEY;
+    getEnv("MOCK_COUNT") !== "true" &&
+    modelUrl &&
+    getEnv("ROBOFLOW_API_KEY");
 
   if (!useRoboflow) {
     // Mock returns counts in [1, 10] inclusive. The sample CSV has expecteds
@@ -123,14 +129,14 @@ async function runDetection(imageBase64) {
 
   const base64 = String(imageBase64).replace(/^data:image\/\w+;base64,/, "");
 
-  // Build URL safely whether ROBOFLOW_MODEL_URL has existing query params or not.
+  // Build URL safely whether the model URL has existing query params or not.
   let url;
   try {
-    url = new URL(process.env.ROBOFLOW_MODEL_URL);
+    url = new URL(modelUrl);
   } catch {
-    throw new Error("ROBOFLOW_MODEL_URL is not a valid URL");
+    throw new Error("Active model URL is not a valid URL");
   }
-  url.searchParams.set("api_key", process.env.ROBOFLOW_API_KEY);
+  url.searchParams.set("api_key", getEnv("ROBOFLOW_API_KEY"));
 
   const response = await fetch(url.toString(), {
     method: "POST",
@@ -148,12 +154,12 @@ async function runDetection(imageBase64) {
     throw new Error(result?.message || `Roboflow returned ${response.status}`);
   }
 
-  const threshold = Number(process.env.COUNT_CONFIDENCE_THRESHOLD || 0.65);
+  const threshold = Number(getEnv("COUNT_CONFIDENCE_THRESHOLD") || 0.65);
   // Boxes within this fraction of the image edge are treated as cut off and
   // dropped from the count. Cropping client-side already eliminates most
   // edge-clipped parts, but if the operator hasn't recomposed and a part is
   // still partly inside the gold frame, this catches it server-side too.
-  const edgeMarginRatio = Number(process.env.COUNT_EDGE_MARGIN_RATIO || 0.015);
+  const edgeMarginRatio = Number(getEnv("COUNT_EDGE_MARGIN_RATIO") || 0.015);
 
   const predictions = Array.isArray(result.predictions) ? result.predictions : [];
 
